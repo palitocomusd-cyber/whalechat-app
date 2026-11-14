@@ -4,6 +4,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 const PORT = Number(process.env.PORT || 8090);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -214,8 +215,34 @@ async function sendPush(userId, payload) {
 
 function json(res, code, body) {
   const data = JSON.stringify(body);
-  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(data), 'cache-control': 'no-store', 'access-control-allow-origin': '*', 'access-control-allow-headers': 'content-type', 'access-control-allow-methods': 'GET,POST,OPTIONS' });
+  const headers = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*', 'access-control-allow-headers': 'content-type', 'access-control-allow-methods': 'GET,POST,OPTIONS', vary: 'Accept-Encoding' };
+  if (res.__wcGzip && data.length > 4096) {
+    zlib.gzip(data, { level: 5 }, (err, gz) => {
+      if (res.headersSent || res.writableEnded) return;
+      if (err) { headers['content-length'] = Buffer.byteLength(data); res.writeHead(code, headers); return res.end(data); }
+      headers['content-encoding'] = 'gzip'; headers['content-length'] = gz.length;
+      res.writeHead(code, headers); res.end(gz);
+    });
+    return;
+  }
+  headers['content-length'] = Buffer.byteLength(data);
+  res.writeHead(code, headers);
   res.end(data);
+}
+
+/* compressed static responses, cached per file + mtime */
+const STATIC_CACHE = new Map();
+const COMPRESSIBLE = /\.(html?|js|mjs|css|json|svg|webmanifest|txt|xml)$/i;
+function cachedStatic(file, st, transform) {
+  const key = file;
+  const hit = STATIC_CACHE.get(key);
+  if (hit && hit.mtime === st.mtimeMs && hit.size === st.size) return hit;
+  let raw = fs.readFileSync(file);
+  if (transform) raw = Buffer.from(transform(raw.toString('utf8')));
+  const entry = { mtime: st.mtimeMs, size: st.size, raw, gz: raw.length > 1024 ? zlib.gzipSync(raw, { level: 7 }) : null };
+  STATIC_CACHE.set(key, entry);
+  if (STATIC_CACHE.size > 200) STATIC_CACHE.delete(STATIC_CACHE.keys().next().value);
+  return entry;
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -300,17 +327,20 @@ function serveStatic(req, res, pathname) {
     const ext = path.extname(file).toLowerCase();
     const isHtml = ext === '.html';
     const headers = { 'content-type': mime(file), 'content-length': st.size, 'x-content-type-options': 'nosniff', 'cache-control': isHtml || ext === '.webmanifest' ? 'no-cache' : (rel === '/sw.js' ? 'no-cache' : 'public, max-age=3600') };
-    if (isHtml) {
-      fs.readFile(file, (e2, buf) => {
-        if (e2) return notFound(res);
-        let html = buf.toString('utf8');
-        if (path.basename(file) === 'whalechat.html') {
-          html = html.replace('<head>', '<head>\n<script>window.__WC_SERVER__ = true; window.__WC_PUBLIC_URL__ = ' + JSON.stringify(PUBLIC_URL || '') + ';</script>');
-        }
-        const out = Buffer.from(html); headers['content-length'] = out.length;
-        res.writeHead(200, headers); res.end(out);
-      });
-      return;
+    if (COMPRESSIBLE.test(file) && st.size < 8 * 1024 * 1024) {
+      let entry;
+      try {
+        entry = cachedStatic(file, st, path.basename(file) === 'whalechat.html'
+          ? (html) => html.replace('<head>', '<head>\n<script>window.__WC_SERVER__ = true; window.__WC_PUBLIC_URL__ = ' + JSON.stringify(PUBLIC_URL || '') + ';</script>')
+          : null);
+      } catch (e2) { return notFound(res); }
+      headers.vary = 'Accept-Encoding';
+      const useGz = entry.gz && res.__wcGzip;
+      const body = useGz ? entry.gz : entry.raw;
+      if (useGz) headers['content-encoding'] = 'gzip';
+      headers['content-length'] = body.length;
+      res.writeHead(200, headers);
+      return res.end(req.method === 'HEAD' ? undefined : body);
     }
     res.writeHead(200, headers);
     fs.createReadStream(file).pipe(res);
@@ -459,6 +489,9 @@ async function api(req, res, pathname, query) {
   if (pathname === '/api/health' && req.method === 'GET') {
     return json(res, 200, { ok: true, app: 'whalechat', version: readJSON(path.join(PUBLIC_DIR, 'version.json'), {}).version || null, build: (readJSON(path.join(PUBLIC_DIR, 'version.json'), {}).build) || BUILD, uptimeSec: Math.floor((Date.now() - STARTED) / 1000), rev: store.rev, users: (store.db && store.db.users) ? store.db.users.length : 0, clients: clients.size, push: !!webpush, publicUrl: PUBLIC_URL || null, storage: pool ? 'postgres' : 'file', email: !!(email && email.configured()), market: market.status() });
   }
+  if (pathname === '/api/ping' && (req.method === 'GET' || req.method === 'HEAD')) {
+    return json(res, 200, { ok: true, rev: store.rev, at: Date.now() });
+  }
   if (pathname === '/api/state' && req.method === 'GET') return json(res, 200, { rev: store.rev, db: store.db, updatedAt: store.updatedAt });
   if (pathname === '/api/state/init' && req.method === 'POST') {
     if (store.db) return json(res, 409, { ok: false, error: 'already_initialised', rev: store.rev });
@@ -489,7 +522,7 @@ async function api(req, res, pathname, query) {
     res.write('retry: 3000\n\n');
     res.write(`event: hello\ndata: ${JSON.stringify({ rev: store.rev })}\n\n`);
     clients.add(res);
-    const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch (e) {} }, 25000);
+    const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch (e) {} }, 15000);
     req.on('close', () => { clearInterval(ping); clients.delete(res); });
     return;
   }
@@ -903,6 +936,7 @@ async function api(req, res, pathname, query) {
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://localhost');
   const pathname = u.pathname;
+  res.__wcGzip = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
   if (req.method === 'OPTIONS') {
     res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': 'content-type', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-max-age': '86400' });
     return res.end();
@@ -921,6 +955,19 @@ const server = http.createServer(async (req, res) => {
 });
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 70000;
+server.requestTimeout = 0;
+/* self keep-alive: hosts that idle-sleep a service (free tiers) count inbound
+   traffic, so ping our own public URL. KEEPALIVE=off disables it. */
+const SELF_URL = (PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+if (SELF_URL && process.env.KEEPALIVE !== 'off') {
+  const lib = SELF_URL.startsWith('https:') ? require('https') : http;
+  setInterval(() => {
+    try {
+      const r = lib.get(SELF_URL + '/api/ping', { timeout: 10000 }, (resp) => resp.resume());
+      r.on('timeout', () => r.destroy()); r.on('error', () => {});
+    } catch (e) {}
+  }, 4 * 60 * 1000).unref();
+}
 (async () => {
   await initStorage();
   ensureTradingAssets();
@@ -958,3 +1005,4 @@ function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('uncaughtException', (e) => console.error('[uncaught]', e));
+process.on('unhandledRejection', (e) => console.error('[unhandled]', e && e.message ? e.message : e));
