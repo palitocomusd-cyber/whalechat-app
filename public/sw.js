@@ -1,7 +1,7 @@
 /* =========================================================================
    WhaleChat service worker — offline shell, in-place updates, Web Push
    ========================================================================= */
-const VERSION = 'wc-v3.9.10-1';
+const VERSION = 'wc-v3.37.0-1';
 const SHELL = [
   './',
   './index.html',
@@ -49,18 +49,25 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.startsWith('/api/')) return;          // never cache live data
 
   // HTML: network-first so a new release is picked up immediately, cache as offline fallback
+  // A slow network (or a server waking up) falls back to the cached copy after
+  // a few seconds, while the network response still refreshes the cache.
   if (req.mode === 'navigate' || /\.html?$/.test(url.pathname) || url.pathname === '/' ) {
-    event.respondWith(
-      fetch(req)
-        .then((res) => {
-          if (res && res.ok) {
-            const copy = res.clone();
-            caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {});
-          }
-          return res;
-        })
-        .catch(() => caches.match(req).then((hit) => hit || caches.match('./whalechat.html')).then((hit) => hit || Response.error()))
-    );
+    const network = fetch(req).then((res) => {
+      if (res && res.ok) {
+        const copy = res.clone();
+        caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {});
+      }
+      return res;
+    });
+    const fallback = () => caches.match(req).then((hit) => hit || caches.match('./whalechat.html'));
+    event.respondWith(new Promise((resolve) => {
+      let done = false;
+      const finish = (r) => { if (!done && r) { done = true; resolve(r); } };
+      const timer = setTimeout(() => { fallback().then(finish); }, 3500);
+      network.then((res) => { clearTimeout(timer); finish(res); })
+        .catch(() => { clearTimeout(timer); fallback().then((hit) => { finish(hit || Response.error()); if (!done) resolve(Response.error()); }); });
+    }));
+    event.waitUntil(network.catch(() => {}));
     return;
   }
 

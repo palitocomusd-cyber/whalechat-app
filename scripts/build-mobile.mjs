@@ -9,7 +9,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
 const src = path.join(root, 'public');
 const out = path.resolve(process.env.WWW_DIR || path.join(root, 'mobile', 'www'));
-const sync = (process.env.WC_SYNC_SERVER || '').replace(/\/+$/, '');
+const sync = (process.env.WC_SYNC_SERVER || (() => { try { return JSON.parse(fs.readFileSync(path.join(root, 'public', 'release.json'), 'utf8')).syncServer || ''; } catch (e) { return ''; } })()).replace(/\/+$/, '');
 
 function copyDir(from, to) {
   fs.mkdirSync(to, { recursive: true });

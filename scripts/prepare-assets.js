@@ -70,7 +70,8 @@ const MODULES = [
   { file: 'portfolio-share.js', marker: 'wc-portfolio-share' },
   { file: 'pro-chart.js', marker: 'wc-pro-chart' },
   { file: 'readability.js', marker: 'wc-readability' },
-  { file: 'typography.js', marker: 'wc-typography' }
+  { file: 'typography.js', marker: 'wc-typography' },
+  { file: 'seamless.js', marker: 'wc-seamless' }
 ];
 try {
   let page = fs.readFileSync(APP, 'utf8');
@@ -111,6 +112,12 @@ try {
   }
   page = page.replace(/const APP_VERSION = '[^']*';/, "const APP_VERSION = '" + version + "';")
              .replace(/const APP_BUILD = '[^']*';/, "const APP_BUILD = '" + build + "';");
+  /* every copy of the app (static host, installed PWA, mobile shell) joins the
+     same shared server, so accounts work on any device without setup */
+  const syncServer = String(process.env.WC_SYNC_SERVER || meta.syncServer || '').replace(/\/+$/, '');
+  if (syncServer && /^https?:\/\/[^'\s]+$/.test(syncServer)) {
+    page = page.replace(/const DEFAULT_SYNC_SERVER = '[^']*';/, "const DEFAULT_SYNC_SERVER = '" + syncServer + "';");
+  }
   fs.writeFileSync(APP, page);
   const next = Object.assign({}, meta, {
     file: 'whalechat.html',

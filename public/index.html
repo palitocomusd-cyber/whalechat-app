@@ -70,7 +70,7 @@ s0.parentNode.insertBefore(s1,s0);
       ? './whalechat.html?ref=' + encodeURIComponent(code) + '#/signup?ref=' + encodeURIComponent(code)
       : './whalechat.html' + location.search + (location.hash || '');
     // small delay so the branded entry never flashes as a dead end
-    setTimeout(function () { location.replace(target); }, 550);
+    setTimeout(function () { location.replace(target); }, 150);
     document.querySelector('a').addEventListener('click', function () { location.href = target; });
   })();
   </script>
